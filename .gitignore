@@ -18,3 +18,9 @@ examples/dyplomat/dyplomat
 /envoy*.log
 
 .tools/
+
+# Gas Town (added by gt)
+.runtime/
+.claude/commands/
+.logs/
+.beads/
