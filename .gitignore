@@ -24,3 +24,4 @@ examples/dyplomat/dyplomat
 .claude/commands/
 .logs/
 .beads/
+.worktrees
