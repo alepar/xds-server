@@ -27,6 +27,7 @@ static_resources:
                 codec_type: AUTO
                 route_config:
                   name: local_route
+                  validate_clusters: false
                   virtual_hosts:
                     - name: backend
                       domains: ["*"]

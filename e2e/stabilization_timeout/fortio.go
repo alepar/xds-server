@@ -113,9 +113,9 @@ func (r *FortioResult) GetPercentile(pct float64) float64 {
 	if r.DurationHistogram == nil {
 		return -1
 	}
-	target := pct / 100.0
+	// Fortio stores percentiles as 50, 75, 90, 99, 99.9 (not 0.5, 0.75, etc.)
 	for _, p := range r.DurationHistogram.Percentiles {
-		if p.Percentile >= target-0.001 && p.Percentile <= target+0.001 {
+		if p.Percentile >= pct-0.1 && p.Percentile <= pct+0.1 {
 			return p.Value
 		}
 	}
@@ -126,7 +126,7 @@ func (r *FortioResult) GetPercentile(pct float64) float64 {
 		return sorted[i].Percentile < sorted[j].Percentile
 	})
 	for _, p := range sorted {
-		if p.Percentile >= target {
+		if p.Percentile >= pct {
 			return p.Value
 		}
 	}

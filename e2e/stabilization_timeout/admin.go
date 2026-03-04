@@ -108,6 +108,17 @@ func (h *ClusterHost) HasFlag(flag string) bool {
 	return false
 }
 
+// IsHealthy returns true if the host has no problematic health flags.
+// Envoy reports "healthy" as a flag value when the host is healthy.
+func (h *ClusterHost) IsHealthy() bool {
+	for _, f := range h.HealthFlags {
+		if f != "healthy" && f != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // FindHost returns the host matching the given address, or nil.
 func FindHost(hosts []ClusterHost, addr string) *ClusterHost {
 	for i := range hosts {
@@ -211,7 +222,7 @@ func (a *AdminClient) WaitForHostHealthy(cluster, addr string, timeout time.Dura
 		hosts, err := a.GetClusterHosts(cluster)
 		if err == nil {
 			h := FindHost(hosts, addr)
-			if h != nil && len(h.HealthFlags) == 0 {
+			if h != nil && h.IsHealthy() {
 				return nil
 			}
 		}
