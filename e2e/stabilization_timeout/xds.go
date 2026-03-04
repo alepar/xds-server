@@ -33,14 +33,15 @@ const (
 
 // XDSController serves CDS/EDS and allows per-endpoint mutations.
 type XDSController struct {
-	mu           sync.Mutex
-	endpoints    map[int]bool // port -> present
-	cache        cachev3.SnapshotCache
-	version      atomic.Int64
-	timeoutMs    uint
-	healthChecks bool
-	grpcServer   *grpc.Server
-	listener     net.Listener
+	mu                    sync.Mutex
+	endpoints             map[int]bool // port -> present
+	cache                 cachev3.SnapshotCache
+	version               atomic.Int64
+	timeoutMs             uint
+	healthChecks          bool
+	ignoreHealthOnRemoval bool
+	grpcServer            *grpc.Server
+	listener              net.Listener
 }
 
 func NewXDSController() *XDSController {
@@ -96,12 +97,22 @@ func (x *XDSController) Restart(port int) error {
 	return x.Start(port)
 }
 
+// WithIgnoreHealthOnRemoval sets the ignore_health_on_host_removal cluster field.
+func WithIgnoreHealthOnRemoval(v bool) func(*XDSController) {
+	return func(x *XDSController) {
+		x.ignoreHealthOnRemoval = v
+	}
+}
+
 // SetClusterConfig changes the cluster's HC and timeout settings.
 // Call before adding endpoints (or call pushSnapshot to apply immediately).
-func (x *XDSController) SetClusterConfig(timeoutMs uint, healthChecks bool) error {
+func (x *XDSController) SetClusterConfig(timeoutMs uint, healthChecks bool, opts ...func(*XDSController)) error {
 	x.mu.Lock()
 	x.timeoutMs = timeoutMs
 	x.healthChecks = healthChecks
+	for _, opt := range opts {
+		opt(x)
+	}
 	x.mu.Unlock()
 	return x.pushSnapshot()
 }
@@ -134,10 +145,22 @@ func (x *XDSController) RemoveAllEndpoints() error {
 	return x.pushSnapshot()
 }
 
+// ReplaceEndpoints atomically replaces all endpoints with the given set.
+func (x *XDSController) ReplaceEndpoints(ports ...int) error {
+	x.mu.Lock()
+	x.endpoints = make(map[int]bool)
+	for _, p := range ports {
+		x.endpoints[p] = true
+	}
+	x.mu.Unlock()
+	return x.pushSnapshot()
+}
+
 func (x *XDSController) pushSnapshot() error {
 	x.mu.Lock()
 	timeoutMs := x.timeoutMs
 	hc := x.healthChecks
+	ignoreHC := x.ignoreHealthOnRemoval
 	ports := make([]int, 0, len(x.endpoints))
 	for p := range x.endpoints {
 		ports = append(ports, p)
@@ -145,7 +168,7 @@ func (x *XDSController) pushSnapshot() error {
 	x.mu.Unlock()
 
 	v := fmt.Sprintf("%d", x.version.Add(1))
-	c := x.makeCluster(timeoutMs, hc)
+	c := x.makeCluster(timeoutMs, hc, ignoreHC)
 	e := x.makeEndpoints(ports)
 	snap, err := cachev3.NewSnapshot(v, map[resource.Type][]types.Resource{
 		resource.ClusterType:  {c},
@@ -157,7 +180,7 @@ func (x *XDSController) pushSnapshot() error {
 	return x.cache.SetSnapshot(context.Background(), nodeID, snap)
 }
 
-func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool) *cluster.Cluster {
+func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool, ignoreHealthOnRemoval bool) *cluster.Cluster {
 	c := &cluster.Cluster{
 		Name:                 clusterName,
 		ConnectTimeout:       durationpb.New(1 * time.Second),
@@ -204,6 +227,10 @@ func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool) *cluster.
 				"envoy.eds": s,
 			},
 		}
+	}
+
+	if ignoreHealthOnRemoval {
+		c.IgnoreHealthOnHostRemoval = true
 	}
 
 	return c
