@@ -39,8 +39,9 @@ type XDSController struct {
 	version               atomic.Int64
 	timeoutMs             uint
 	healthChecks          bool
-	ignoreHealthOnRemoval bool
-	grpcServer            *grpc.Server
+	ignoreHealthOnRemoval   bool
+	ignoreNewHostsUntilHC   bool
+	grpcServer              *grpc.Server
 	listener              net.Listener
 }
 
@@ -104,6 +105,13 @@ func WithIgnoreHealthOnRemoval(v bool) func(*XDSController) {
 	}
 }
 
+// WithIgnoreNewHostsUntilFirstHC sets ignore_new_hosts_until_first_hc on CommonLbConfig.
+func WithIgnoreNewHostsUntilFirstHC(v bool) func(*XDSController) {
+	return func(x *XDSController) {
+		x.ignoreNewHostsUntilHC = v
+	}
+}
+
 // SetClusterConfig changes the cluster's HC and timeout settings.
 // Call before adding endpoints (or call pushSnapshot to apply immediately).
 func (x *XDSController) SetClusterConfig(timeoutMs uint, healthChecks bool, opts ...func(*XDSController)) error {
@@ -161,6 +169,7 @@ func (x *XDSController) pushSnapshot() error {
 	timeoutMs := x.timeoutMs
 	hc := x.healthChecks
 	ignoreHC := x.ignoreHealthOnRemoval
+	ignoreNewHosts := x.ignoreNewHostsUntilHC
 	ports := make([]int, 0, len(x.endpoints))
 	for p := range x.endpoints {
 		ports = append(ports, p)
@@ -168,7 +177,7 @@ func (x *XDSController) pushSnapshot() error {
 	x.mu.Unlock()
 
 	v := fmt.Sprintf("%d", x.version.Add(1))
-	c := x.makeCluster(timeoutMs, hc, ignoreHC)
+	c := x.makeCluster(timeoutMs, hc, ignoreHC, ignoreNewHosts)
 	e := x.makeEndpoints(ports)
 	snap, err := cachev3.NewSnapshot(v, map[resource.Type][]types.Resource{
 		resource.ClusterType:  {c},
@@ -180,7 +189,7 @@ func (x *XDSController) pushSnapshot() error {
 	return x.cache.SetSnapshot(context.Background(), nodeID, snap)
 }
 
-func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool, ignoreHealthOnRemoval bool) *cluster.Cluster {
+func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool, ignoreHealthOnRemoval bool, ignoreNewHostsUntilHC bool) *cluster.Cluster {
 	c := &cluster.Cluster{
 		Name:                 clusterName,
 		ConnectTimeout:       durationpb.New(1 * time.Second),
@@ -231,6 +240,13 @@ func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool, ignoreHea
 
 	if ignoreHealthOnRemoval {
 		c.IgnoreHealthOnHostRemoval = true
+	}
+
+	if ignoreNewHostsUntilHC {
+		if c.CommonLbConfig == nil {
+			c.CommonLbConfig = &cluster.Cluster_CommonLbConfig{}
+		}
+		c.CommonLbConfig.IgnoreNewHostsUntilFirstHc = true
 	}
 
 	return c

@@ -72,6 +72,7 @@ func runBench(cfg *BenchConfig) {
 		label:                 "fixed",
 		envoyBinary:           cfg.EnvoyWithFix,
 		ignoreHealthOnRemoval: false,
+		ignoreNewHostsUntilHC: true,
 		timeoutMs:             60000,
 	})
 
@@ -81,10 +82,11 @@ func runBench(cfg *BenchConfig) {
 }
 
 type benchScenarioConfig struct {
-	label                 string
-	envoyBinary           string
-	ignoreHealthOnRemoval bool
-	timeoutMs             uint
+	label                    string
+	envoyBinary              string
+	ignoreHealthOnRemoval    bool
+	ignoreNewHostsUntilHC    bool
+	timeoutMs                uint
 }
 
 type benchResult struct {
@@ -112,6 +114,9 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 	var opts []func(*XDSController)
 	if sc.ignoreHealthOnRemoval {
 		opts = append(opts, WithIgnoreHealthOnRemoval(true))
+	}
+	if sc.ignoreNewHostsUntilHC {
+		opts = append(opts, WithIgnoreNewHostsUntilFirstHC(true))
 	}
 	xds.SetClusterConfig(sc.timeoutMs, true, opts...)
 
@@ -173,12 +178,7 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 	log.Printf("[%s] Swapping endpoints: %d healthy + %d black holes",
 		sc.label, cfg.HealthyCount, cfg.TotalCount-cfg.HealthyCount)
 
-	// Stop all old backends
-	for _, port := range initialPorts {
-		backends.Stop(port)
-	}
-
-	// Start new backends — first healthy-count get real HTTP servers,
+	// Start new backends BEFORE the EDS push — healthy ones get real HTTP servers,
 	// remaining ports get no listener (black holes / connection refused)
 	newPorts := make([]int, cfg.TotalCount)
 	for i := range newPorts {
@@ -191,6 +191,10 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 	}
 	// Black hole ports: no listener started
 
+	// EDS push: atomically replace old endpoints with new ones.
+	// Old backends keep running — with the fix, old endpoints stay in
+	// PENDING_DYNAMIC_REMOVAL and continue serving traffic until the new
+	// ones are health-checked and warmed up.
 	swapTime := time.Now()
 	if err := xds.ReplaceEndpoints(newPorts...); err != nil {
 		log.Fatalf("[%s] replace endpoints: %v", sc.label, err)
