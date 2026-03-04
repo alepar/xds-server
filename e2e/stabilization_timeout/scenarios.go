@@ -40,10 +40,10 @@ var Scenario0_BaselineWithoutFix = ScenarioDef{
 			}
 		}()
 
-		// Add endpoints, wait for healthy
+		// Add endpoints, wait for healthy (must pass HC before removal triggers stabilization)
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", fmt.Errorf("host %d not healthy: %w", port, err)
 			}
 		}
@@ -96,7 +96,7 @@ var ScenarioA_HostReAdd = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 		}
@@ -149,7 +149,7 @@ var ScenarioB_HCFailure = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 		}
@@ -199,7 +199,7 @@ var ScenarioC_PartialRemoval = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 		}
@@ -250,7 +250,7 @@ var ScenarioD_ShortTimeout = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 		}
@@ -290,7 +290,7 @@ var ScenarioE_ManyHosts = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 15*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 15*time.Second); err != nil {
 				return "", err
 			}
 		}
@@ -323,7 +323,7 @@ var ScenarioF_XDSDisconnect = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 		}
@@ -399,7 +399,7 @@ var ScenarioH_AdminFidelity = ScenarioDef{
 
 		env.XDS.AddEndpoints(p...)
 		for _, port := range p {
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 		}

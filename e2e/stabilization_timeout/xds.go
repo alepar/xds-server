@@ -182,9 +182,9 @@ func (x *XDSController) makeCluster(timeoutMs uint, healthChecks bool) *cluster.
 
 	if healthChecks {
 		c.HealthChecks = []*core.HealthCheck{{
-			Timeout:            durationpb.New(1 * time.Second),
-			Interval:           durationpb.New(1 * time.Second),
-			NoTrafficInterval:  durationpb.New(1 * time.Second),
+			Timeout:            durationpb.New(250 * time.Millisecond),
+			Interval:           durationpb.New(250 * time.Millisecond),
+			NoTrafficInterval:  durationpb.New(250 * time.Millisecond),
 			UnhealthyThreshold: &wrapperspb.UInt32Value{Value: 1},
 			HealthyThreshold:   &wrapperspb.UInt32Value{Value: 1},
 			HealthChecker: &core.HealthCheck_HttpHealthCheck_{

@@ -180,7 +180,7 @@ func stressAddRemoveTimeout() ScenarioDef {
 			defer env.Backends.Stop(port)
 
 			env.XDS.AddEndpoints(port)
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 
@@ -208,7 +208,7 @@ func stressHCFailure() ScenarioDef {
 			defer env.Backends.Stop(port)
 
 			env.XDS.AddEndpoints(port)
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 
@@ -234,7 +234,7 @@ func stressHostReAdd() ScenarioDef {
 			defer env.Backends.Stop(port)
 
 			env.XDS.AddEndpoints(port)
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 
@@ -275,7 +275,7 @@ func stressPartialRemoval() ScenarioDef {
 
 			env.XDS.AddEndpoints(p...)
 			for _, port := range p {
-				if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+				if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 					return "", err
 				}
 			}
@@ -311,7 +311,7 @@ func stressLongLivedHealthy() ScenarioDef {
 			defer env.Backends.Stop(port)
 
 			env.XDS.AddEndpoints(port)
-			if err := env.Admin.WaitForHostPresent(clusterName, addr(port), 10*time.Second); err != nil {
+			if err := env.Admin.WaitForHostHealthy(clusterName, addr(port), 10*time.Second); err != nil {
 				return "", err
 			}
 

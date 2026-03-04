@@ -200,3 +200,22 @@ func (a *AdminClient) WaitForHostPresent(cluster, addr string, timeout time.Dura
 	}
 	return fmt.Errorf("host %s not healthy after %v", addr, timeout)
 }
+
+// WaitForHostHealthy polls until the host is listed with no health flags at all
+// (no FAILED_ACTIVE_HC, no PENDING_DYNAMIC_REMOVAL, etc). This ensures the host
+// has passed its first active health check, which is required before EDS removal
+// will trigger the PENDING_DYNAMIC_REMOVAL stabilization path.
+func (a *AdminClient) WaitForHostHealthy(cluster, addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		hosts, err := a.GetClusterHosts(cluster)
+		if err == nil {
+			h := FindHost(hosts, addr)
+			if h != nil && len(h.HealthFlags) == 0 {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("host %s not fully healthy after %v", addr, timeout)
+}
