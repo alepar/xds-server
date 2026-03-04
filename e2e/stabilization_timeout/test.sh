@@ -42,11 +42,21 @@ trap cleanup EXIT
 
 start_socat() {
     for port in $BACKEND_PORT_1 $BACKEND_PORT_2; do
-        socat TCP-LISTEN:${port},fork,reuseaddr \
-            SYSTEM:'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"' &
+        python3 -c "
+import http.server, socketserver
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Length','2')
+        self.end_headers()
+        self.wfile.write(b'ok')
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.TCPServer(('', ${port}), H).serve_forever()
+" &
         PIDS+=($!)
     done
-    echo "socat backends on :${BACKEND_PORT_1}, :${BACKEND_PORT_2}"
+    echo "python backends on :${BACKEND_PORT_1}, :${BACKEND_PORT_2}"
 }
 
 stop_socat() {
@@ -88,7 +98,7 @@ wait_for_url() {
 
 count_cluster_hosts() {
     curl -sf "http://127.0.0.1:${ADMIN_PORT}/clusters" \
-        | grep -c "^test-cluster::" || echo 0
+        | grep -oP '^test-cluster::\d+\.\d+\.\d+\.\d+:\d+' | sort -u | wc -l
 }
 
 has_pending_removal() {
@@ -161,7 +171,7 @@ start_socat
 start_xds_server 0
 wait_for_url "http://127.0.0.1:${HTTP_PORT}/ready"
 start_envoy "$ENVOY_WITHOUT_FIX"
-wait_for_url "http://127.0.0.1:${ADMIN_PORT}/ready"
+wait_for_url "http://127.0.0.1:${ADMIN_PORT}/ready" 30
 
 # Add targets, wait for health checks to pass
 curl -sf -X POST "http://127.0.0.1:${HTTP_PORT}/add-targets"
@@ -221,7 +231,7 @@ start_socat
 start_xds_server "$STABILIZATION_TIMEOUT_MS"
 wait_for_url "http://127.0.0.1:${HTTP_PORT}/ready"
 start_envoy "$ENVOY_WITH_FIX"
-wait_for_url "http://127.0.0.1:${ADMIN_PORT}/ready"
+wait_for_url "http://127.0.0.1:${ADMIN_PORT}/ready" 30
 
 # Add targets, wait for health checks
 curl -sf -X POST "http://127.0.0.1:${HTTP_PORT}/add-targets"
