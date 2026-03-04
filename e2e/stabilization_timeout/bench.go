@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -32,9 +34,9 @@ func parseBenchFlags(args []string) *BenchConfig {
 	fs.IntVar(&cfg.AdminPort, "admin-port", 9901, "Envoy admin port")
 	fs.IntVar(&cfg.XDSPort, "xds-port", 5678, "xDS gRPC port")
 	fs.IntVar(&cfg.BasePort, "base-port", 8081, "Base port for backend pool")
-	fs.IntVar(&cfg.QPS, "qps", 500, "Fortio target QPS")
+	fs.IntVar(&cfg.QPS, "qps", 500, "Target QPS for load generator")
 	fs.DurationVar(&cfg.WarmupDuration, "warmup", 10*time.Second, "Warmup duration before endpoint swap")
-	fs.DurationVar(&cfg.TestDuration, "duration", 30*time.Second, "Total fortio test duration (warmup + transition)")
+	fs.DurationVar(&cfg.TestDuration, "duration", 30*time.Second, "Total test duration (warmup + transition)")
 	fs.IntVar(&cfg.HealthyCount, "healthy-count", 3, "Number of healthy backends after swap")
 	fs.IntVar(&cfg.TotalCount, "total-count", 5, "Total backends after swap (healthy + black holes)")
 
@@ -91,8 +93,9 @@ type benchScenarioConfig struct {
 
 type benchResult struct {
 	Label       string
-	Fortio      *FortioResult
+	Load        *LoadResult
 	SwapTime    time.Time
+	SwapOffset  time.Duration
 	EnvoyBinary string
 }
 
@@ -150,24 +153,24 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 	// Wait for all hosts to become healthy
 	for _, port := range initialPorts {
 		if err := admin.WaitForHostHealthy(clusterName, addr(port), 15*time.Second); err != nil {
+			hosts, herr := admin.GetClusterHosts(clusterName)
+			if herr == nil {
+				log.Printf("[%s] Cluster state at failure: %+v", sc.label, hosts)
+			}
 			log.Fatalf("[%s] host %d not healthy: %v", sc.label, port, err)
 		}
 	}
 	log.Printf("[%s] All %d hosts healthy", sc.label, len(initialPorts))
 
-	// Start Fortio in background (total duration covers warmup + transition)
-	jsonPath := fmt.Sprintf("bench-result-%s.json", sc.label)
+	// Start load generator in background
 	target := "http://127.0.0.1:10000/"
+	lg := NewLoadGen(target, cfg.QPS, 16)
+	loadCtx, loadCancel := context.WithTimeout(context.Background(), cfg.TestDuration)
+	defer loadCancel()
 
-	fortioDone := make(chan *FortioResult, 1)
-	fortioErr := make(chan error, 1)
+	loadDone := make(chan *LoadResult, 1)
 	go func() {
-		result, err := FortioRun(target, cfg.QPS, cfg.TestDuration.String(), jsonPath)
-		if err != nil {
-			fortioErr <- err
-		} else {
-			fortioDone <- result
-		}
+		loadDone <- lg.Run(loadCtx)
 	}()
 
 	// Warmup phase
@@ -192,35 +195,43 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 	// Black hole ports: no listener started
 
 	// EDS push: atomically replace old endpoints with new ones.
-	// Old backends keep running — with the fix, old endpoints stay in
-	// PENDING_DYNAMIC_REMOVAL and continue serving traffic until the new
-	// ones are health-checked and warmed up.
 	swapTime := time.Now()
 	if err := xds.ReplaceEndpoints(newPorts...); err != nil {
 		log.Fatalf("[%s] replace endpoints: %v", sc.label, err)
 	}
 	log.Printf("[%s] Endpoints swapped at %s", sc.label, swapTime.Format("15:04:05.000"))
 
-	// Wait for Fortio to finish
-	log.Printf("[%s] Waiting for fortio to complete...", sc.label)
-	select {
-	case result := <-fortioDone:
-		log.Printf("[%s] Fortio done: %d requests, %.1f%% success rate",
-			sc.label, result.TotalRequests(), result.SuccessRate()*100)
-		return &benchResult{
-			Label:       sc.label,
-			Fortio:      result,
-			SwapTime:    swapTime,
-			EnvoyBinary: sc.envoyBinary,
-		}
-	case err := <-fortioErr:
-		log.Fatalf("[%s] fortio failed: %v", sc.label, err)
-		return nil // unreachable
+	// Wait for load generator to finish
+	log.Printf("[%s] Waiting for load generator to complete...", sc.label)
+	loadResult := <-loadDone
+
+	swapOffset := swapTime.Sub(loadResult.StartTime)
+	log.Printf("[%s] Load gen done: %d requests, %.1f%% success rate",
+		sc.label, loadResult.TotalRequests(), loadResult.SuccessRate()*100)
+
+	// Save JSON results
+	jsonPath := fmt.Sprintf("bench-result-%s.json", sc.label)
+	if err := loadResult.WriteJSON(jsonPath); err != nil {
+		log.Printf("[%s] warning: failed to write JSON: %v", sc.label, err)
+	} else {
+		log.Printf("[%s] Results saved to %s", sc.label, jsonPath)
+	}
+
+	return &benchResult{
+		Label:       sc.label,
+		Load:        loadResult,
+		SwapTime:    swapTime,
+		SwapOffset:  swapOffset,
+		EnvoyBinary: sc.envoyBinary,
 	}
 }
 
 func compareBenchResults(legacy, fixed *benchResult) {
 	printBenchSummary(legacy, fixed)
+	fmt.Println()
+	printTimeline("legacy", legacy.Load, legacy.SwapOffset)
+	fmt.Println()
+	printTimeline("fixed", fixed.Load, fixed.SwapOffset)
 }
 
 func printBenchSummary(legacy, fixed *benchResult) {
@@ -236,34 +247,27 @@ func printBenchSummary(legacy, fixed *benchResult) {
 
 	// QPS
 	fmt.Printf("║ %-28s │ %12.1f │ %12.1f ║\n", "Actual QPS",
-		legacy.Fortio.ActualQPS, fixed.Fortio.ActualQPS)
+		legacy.Load.ActualQPS(), fixed.Load.ActualQPS())
 
 	// Total requests
 	fmt.Printf("║ %-28s │ %12d │ %12d ║\n", "Total Requests",
-		legacy.Fortio.TotalRequests(), fixed.Fortio.TotalRequests())
+		legacy.Load.TotalRequests(), fixed.Load.TotalRequests())
 
 	// Success rate
 	fmt.Printf("║ %-28s │ %11.2f%% │ %11.2f%% ║\n", "Success Rate",
-		legacy.Fortio.SuccessRate()*100, fixed.Fortio.SuccessRate()*100)
+		legacy.Load.SuccessRate()*100, fixed.Load.SuccessRate()*100)
 
 	// Error count
 	fmt.Printf("║ %-28s │ %12d │ %12d ║\n", "Errors",
-		legacy.Fortio.ErrorCount(), fixed.Fortio.ErrorCount())
+		legacy.Load.ErrorCount(), fixed.Load.ErrorCount())
 
 	// Latency percentiles
 	for _, pct := range []float64{50, 75, 90, 99} {
-		lVal := legacy.Fortio.GetPercentile(pct)
-		fVal := fixed.Fortio.GetPercentile(pct)
+		lVal := legacy.Load.GetPercentile(pct)
+		fVal := fixed.Load.GetPercentile(pct)
 		label := fmt.Sprintf("p%.0f Latency", pct)
 		fmt.Printf("║ %-28s │ %12s │ %12s ║\n", label,
-			fmtLatency(lVal), fmtLatency(fVal))
-	}
-
-	// Max latency
-	if legacy.Fortio.DurationHistogram != nil && fixed.Fortio.DurationHistogram != nil {
-		fmt.Printf("║ %-28s │ %12s │ %12s ║\n", "Max Latency",
-			fmtLatency(legacy.Fortio.DurationHistogram.Max),
-			fmtLatency(fixed.Fortio.DurationHistogram.Max))
+			fmtDuration(lVal), fmtDuration(fVal))
 	}
 
 	fmt.Printf("╚%s╩%s╩%s╝\n", strings.Repeat("═", w), strings.Repeat("═", 14), strings.Repeat("═", 14))
@@ -271,30 +275,93 @@ func printBenchSummary(legacy, fixed *benchResult) {
 	// Return codes breakdown
 	fmt.Println()
 	fmt.Println("Return Code Breakdown:")
-	allCodes := make(map[string]bool)
-	for code := range legacy.Fortio.RetCodes {
+	allCodes := make(map[int]bool)
+	for code := range legacy.Load.StatusCounts() {
 		allCodes[code] = true
 	}
-	for code := range fixed.Fortio.RetCodes {
+	for code := range fixed.Load.StatusCounts() {
 		allCodes[code] = true
 	}
+	codes := make([]int, 0, len(allCodes))
 	for code := range allCodes {
-		lCount := legacy.Fortio.RetCodes[code]
-		fCount := fixed.Fortio.RetCodes[code]
-		fmt.Printf("  HTTP %s: legacy=%d  fixed=%d\n", code, lCount, fCount)
+		codes = append(codes, code)
+	}
+	sort.Ints(codes)
+	lCounts := legacy.Load.StatusCounts()
+	fCounts := fixed.Load.StatusCounts()
+	for _, code := range codes {
+		label := fmt.Sprintf("HTTP %d", code)
+		if code == 0 {
+			label = "Conn Error"
+		}
+		fmt.Printf("  %s: legacy=%d  fixed=%d\n", label, lCounts[code], fCounts[code])
 	}
 }
 
-// fmtLatency formats a latency value (in seconds) for display.
-func fmtLatency(seconds float64) string {
-	if seconds < 0 {
+func printTimeline(label string, result *LoadResult, swapOffset time.Duration) {
+	bucketSize := 100 * time.Millisecond
+	buckets := result.Timeline(bucketSize)
+	if len(buckets) == 0 {
+		return
+	}
+
+	// Only print buckets within ±2s of swap
+	windowBefore := 2 * time.Second
+	windowAfter := 2 * time.Second
+	swapBucketIdx := int(swapOffset / bucketSize)
+
+	fmt.Printf("Timeline (%s) — 100ms buckets, swap at ≈%.1fs\n", label, swapOffset.Seconds())
+	fmt.Printf("%-12s  %5s  %5s  %5s  %5s  %8s  %8s\n",
+		"Time", "Reqs", "200s", "503s", "Errs", "p50", "p99")
+	fmt.Printf("%-12s  %5s  %5s  %5s  %5s  %8s  %8s\n",
+		"──────────", "─────", "─────", "─────", "─────", "────────", "────────")
+
+	startIdx := int((swapOffset - windowBefore) / bucketSize)
+	endIdx := int((swapOffset + windowAfter) / bucketSize)
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx >= len(buckets) {
+		endIdx = len(buckets) - 1
+	}
+
+	for i := startIdx; i <= endIdx; i++ {
+		b := buckets[i]
+		if b.Total == 0 {
+			continue
+		}
+		// Count 503s specifically from records in this bucket
+		count503 := 0
+		for _, rec := range result.Records {
+			recOffset := rec.Timestamp.Sub(result.StartTime)
+			if recOffset >= b.Start && recOffset < b.End && rec.Status == 503 {
+				count503++
+			}
+		}
+
+		marker := ""
+		if i == swapBucketIdx {
+			marker = "  ← SWAP"
+		}
+		fmt.Printf("%5.1f-%5.1fs  %5d  %5d  %5d  %5d  %8s  %8s%s\n",
+			b.Start.Seconds(), b.End.Seconds(),
+			b.Total, b.Success, count503, b.Errors,
+			fmtDuration(b.P50), fmtDuration(b.P99),
+			marker)
+	}
+}
+
+// fmtDuration formats a time.Duration for display.
+func fmtDuration(d time.Duration) string {
+	if d == 0 {
 		return "N/A"
 	}
-	if seconds < 0.001 {
-		return fmt.Sprintf("%.0fus", seconds*1_000_000)
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.0fus", float64(d.Microseconds()))
 	}
-	if seconds < 1.0 {
-		return fmt.Sprintf("%.2fms", seconds*1000)
+	if d < time.Second {
+		return fmt.Sprintf("%.1fms", float64(d.Microseconds())/1000.0)
 	}
-	return fmt.Sprintf("%.3fs", seconds)
+	return fmt.Sprintf("%.3fs", d.Seconds())
 }
+
