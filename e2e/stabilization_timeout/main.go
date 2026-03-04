@@ -5,186 +5,220 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
-	"sync/atomic"
+	"os"
+	"os/exec"
+	"strings"
+	"syscall"
 	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/keepalive"
-	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/structpb"
-	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
-
-	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
-	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
-	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
-	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 )
 
 var (
-	xdsPort   uint
-	httpPort  uint
-	timeoutMs uint
-	nodeID    string
+	flagEnvoyWithFix    string
+	flagEnvoyWithoutFix string
+	flagAdminPort       int
+	flagXDSPort         int
+	flagStress          string
+	flagBasePort        int
 )
 
 func init() {
-	flag.UintVar(&xdsPort, "xds-port", 5678, "gRPC xDS port")
-	flag.UintVar(&httpPort, "http-port", 5679, "HTTP control port")
-	flag.UintVar(&timeoutMs, "timeout-ms", 0, "host_removal_stabilization_timeout_ms (0=disabled)")
-	flag.StringVar(&nodeID, "node-id", "test-node", "Envoy node ID")
+	flag.StringVar(&flagEnvoyWithFix, "envoy-with-fix", "./envoy-static-with-fix", "Path to envoy binary with fix")
+	flag.StringVar(&flagEnvoyWithoutFix, "envoy-without-fix", "./envoy-static-without-fix", "Path to envoy binary without fix")
+	flag.IntVar(&flagAdminPort, "admin-port", 9901, "Envoy admin port")
+	flag.IntVar(&flagXDSPort, "xds-port", 5678, "xDS gRPC port")
+	flag.StringVar(&flagStress, "stress", "none", "Stress test profile: none|medium|large")
+	flag.IntVar(&flagBasePort, "base-port", 8081, "Base port for backend pool")
 }
 
-func makeCluster(tms uint) *cluster.Cluster {
-	c := &cluster.Cluster{
-		Name:                 "test-cluster",
-		ConnectTimeout:       durationpb.New(1 * time.Second),
-		ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
-		EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
-			EdsConfig: &core.ConfigSource{
-				ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-					ApiConfigSource: &core.ApiConfigSource{
-						ApiType:             core.ApiConfigSource_GRPC,
-						TransportApiVersion: resource.DefaultAPIVersion,
-						GrpcServices: []*core.GrpcService{{
-							TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: "xds_cluster"},
-							},
-						}},
-					},
-				},
-				ResourceApiVersion: resource.DefaultAPIVersion,
-			},
-		},
-		HealthChecks: []*core.HealthCheck{{
-			Timeout:            durationpb.New(1 * time.Second),
-			Interval:           durationpb.New(1 * time.Second),
-			UnhealthyThreshold: &wrapperspb.UInt32Value{Value: 1},
-			HealthyThreshold:   &wrapperspb.UInt32Value{Value: 1},
-			HealthChecker: &core.HealthCheck_HttpHealthCheck_{
-				HttpHealthCheck: &core.HealthCheck_HttpHealthCheck{
-					Path: "/healthz",
-				},
-			},
-		}},
+func getEnvoyVersion(binary string) string {
+	out, err := exec.Command(binary, "--version").CombinedOutput()
+	if err != nil {
+		return "unknown"
 	}
+	lines := strings.Split(string(out), "\n")
+	if len(lines) > 0 {
+		return strings.TrimSpace(lines[0])
+	}
+	return "unknown"
+}
 
-	if tms > 0 {
-		s, _ := structpb.NewStruct(map[string]interface{}{
-			"host_removal_stabilization_timeout_ms": float64(tms),
-		})
-		c.Metadata = &core.Metadata{
-			FilterMetadata: map[string]*structpb.Struct{
-				"envoy.eds": s,
-			},
+// envoyProcess manages an envoy child process.
+type envoyProcess struct {
+	cmd *exec.Cmd
+}
+
+func startEnvoy(binary string, configPath string, _, baseID int) (*envoyProcess, error) {
+	cmd := exec.Command(binary,
+		"-c", configPath,
+		"--log-level", "warn",
+		"--base-id", fmt.Sprintf("%d", baseID),
+	)
+	cmd.Stdout = os.Stderr // forward envoy output to stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start envoy: %w", err)
+	}
+	return &envoyProcess{cmd: cmd}, nil
+}
+
+func (ep *envoyProcess) Stop() {
+	if ep.cmd != nil && ep.cmd.Process != nil {
+		ep.cmd.Process.Signal(syscall.SIGTERM)
+		done := make(chan error, 1)
+		go func() { done <- ep.cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			ep.cmd.Process.Kill()
+			<-done
 		}
-	}
-
-	return c
-}
-
-func makeEndpoints(ports []uint32) *endpoint.ClusterLoadAssignment {
-	var lbEndpoints []*endpoint.LbEndpoint
-	for _, port := range ports {
-		lbEndpoints = append(lbEndpoints, &endpoint.LbEndpoint{
-			HostIdentifier: &endpoint.LbEndpoint_Endpoint{
-				Endpoint: &endpoint.Endpoint{
-					Address: &core.Address{
-						Address: &core.Address_SocketAddress{
-							SocketAddress: &core.SocketAddress{
-								Protocol: core.SocketAddress_TCP,
-								Address:  "127.0.0.1",
-								PortSpecifier: &core.SocketAddress_PortValue{
-									PortValue: port,
-								},
-							},
-						},
-					},
-				},
-			},
-		})
-	}
-	return &endpoint.ClusterLoadAssignment{
-		ClusterName: "test-cluster",
-		Endpoints: []*endpoint.LocalityLbEndpoints{{
-			LbEndpoints: lbEndpoints,
-		}},
 	}
 }
 
 func main() {
 	flag.Parse()
 
-	snapshotCache := cachev3.NewSnapshotCache(false, cachev3.IDHash{}, nil)
-	ctx := context.Background()
-	srv := serverv3.NewServer(ctx, snapshotCache, nil)
-
-	version := &atomic.Int64{}
-
-	// gRPC xDS server
-	grpcServer := grpc.NewServer(
-		grpc.MaxConcurrentStreams(1000),
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    30 * time.Second,
-			Timeout: 5 * time.Second,
-		}),
-	)
-	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, srv)
-	endpointservice.RegisterEndpointDiscoveryServiceServer(grpcServer, srv)
-
-	grpcLis, err := net.Listen("tcp", fmt.Sprintf(":%d", xdsPort))
-	if err != nil {
-		log.Fatalf("gRPC listen: %v", err)
-	}
-	go func() {
-		log.Printf("xDS server listening on :%d", xdsPort)
-		if err := grpcServer.Serve(grpcLis); err != nil {
-			log.Fatalf("gRPC serve: %v", err)
+	// Validate binaries exist
+	for _, bin := range []string{flagEnvoyWithFix, flagEnvoyWithoutFix} {
+		if _, err := os.Stat(bin); err != nil {
+			log.Fatalf("binary not found: %s", bin)
 		}
-	}()
+	}
 
-	// HTTP control server
-	pushSnapshot := func(ports []uint32) error {
-		v := fmt.Sprintf("%d", version.Add(1))
-		c := makeCluster(timeoutMs)
-		e := makeEndpoints(ports)
-		snap, err := cachev3.NewSnapshot(v, map[resource.Type][]types.Resource{
-			resource.ClusterType:  {c},
-			resource.EndpointType: {e},
-		})
+	versionWithFix := getEnvoyVersion(flagEnvoyWithFix)
+	versionWithoutFix := getEnvoyVersion(flagEnvoyWithoutFix)
+
+	report := NewReport(versionWithFix, versionWithoutFix)
+	xds := NewXDSController()
+	admin := NewAdminClient(flagAdminPort)
+	backends := NewBackendPool()
+	defer backends.StopAll()
+
+	configPath := "envoy.yaml" // in the same directory
+
+	log.Println("=== Running Isolated Scenarios ===")
+
+	for _, scenario := range AllIsolatedScenarios() {
+		// Determine which binary and config
+		binary := flagEnvoyWithFix
+		timeoutMs := uint(5000)
+		healthChecks := true
+
+		if scenario.Name == "0. Baseline without fix" {
+			binary = flagEnvoyWithoutFix
+			timeoutMs = 0
+		}
+
+		// Start fresh xDS + envoy for each scenario
+		if err := xds.Start(flagXDSPort); err != nil {
+			log.Fatalf("xds start: %v", err)
+		}
+		xds.SetClusterConfig(timeoutMs, healthChecks)
+
+		envoy, err := startEnvoy(binary, configPath, flagAdminPort, 99)
 		if err != nil {
-			return fmt.Errorf("new snapshot: %w", err)
+			log.Fatalf("envoy start: %v", err)
 		}
-		return snapshotCache.SetSnapshot(ctx, nodeID, snap)
+
+		if err := admin.WaitForReady(15 * time.Second); err != nil {
+			envoy.Stop()
+			xds.Stop()
+			log.Fatalf("envoy not ready: %v", err)
+		}
+
+		// Assign ports for the scenario
+		ports := make([]int, scenario.NumEndpoints)
+		for i := range ports {
+			ports[i] = flagBasePort + i
+		}
+
+		env := &ScenarioEnv{
+			Ports:    ports,
+			XDS:      xds,
+			Admin:    admin,
+			Backends: backends,
+		}
+
+		log.Printf("--- %s ---", scenario.Name)
+		t0 := time.Now()
+		details, runErr := scenario.Run(context.Background(), env)
+		elapsed := time.Since(t0)
+
+		result := ScenarioResult{
+			Name:     scenario.Name,
+			Passed:   runErr == nil,
+			Duration: elapsed,
+			Details:  details,
+		}
+		if runErr != nil {
+			result.Error = runErr.Error()
+			log.Printf("FAIL: %s: %v", scenario.Name, runErr)
+		} else {
+			log.Printf("PASS: %s (%s)", scenario.Name, details)
+		}
+		report.AddIsolated(result)
+
+		// Clean up for next scenario
+		xds.RemoveAllEndpoints()
+		envoy.Stop()
+		xds.Stop()
+		time.Sleep(500 * time.Millisecond) // let ports settle
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/add-targets", func(w http.ResponseWriter, r *http.Request) {
-		if err := pushSnapshot([]uint32{8081, 8082}); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+	// --- Stress Test ---
+	if flagStress != "none" {
+		var numEndpoints int
+		var duration time.Duration
+		switch flagStress {
+		case "medium":
+			numEndpoints = 100
+			duration = 2 * time.Minute
+		case "large":
+			numEndpoints = 1000
+			duration = 10 * time.Minute
+		default:
+			log.Fatalf("unknown stress profile: %s", flagStress)
 		}
-		log.Println("pushed snapshot: 2 targets (8081, 8082)")
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/remove-targets", func(w http.ResponseWriter, r *http.Request) {
-		if err := pushSnapshot(nil); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		log.Println("pushed snapshot: 0 targets")
-		w.WriteHeader(http.StatusOK)
-	})
 
-	log.Printf("HTTP control listening on :%d", httpPort)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", httpPort), mux))
+		log.Printf("=== Stress Test (%s: %d endpoints, %v) ===", flagStress, numEndpoints, duration)
+
+		if err := xds.Start(flagXDSPort); err != nil {
+			log.Fatalf("xds start: %v", err)
+		}
+		xds.SetClusterConfig(3000, true) // 3s timeout for stress
+
+		envoy, err := startEnvoy(flagEnvoyWithFix, configPath, flagAdminPort, 99)
+		if err != nil {
+			log.Fatalf("envoy start: %v", err)
+		}
+		if err := admin.WaitForReady(15 * time.Second); err != nil {
+			log.Fatalf("envoy not ready: %v", err)
+		}
+
+		// Generate port list
+		ports := make([]int, numEndpoints)
+		for i := range ports {
+			ports[i] = flagBasePort + i
+		}
+
+		st := NewStressTest(ports, duration, xds, admin, backends)
+		stressResults := st.Run(context.Background())
+		stressResults.Profile = flagStress
+		report.AddStress(stressResults)
+
+		xds.RemoveAllEndpoints()
+		envoy.Stop()
+		xds.Stop()
+	}
+
+	// --- Report ---
+	fmt.Println()
+	report.Print()
+	if err := report.WriteJSON("test-results.json"); err != nil {
+		log.Printf("warning: failed to write JSON report: %v", err)
+	}
+
+	if !report.AllPassed() {
+		os.Exit(1)
+	}
 }
