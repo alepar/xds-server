@@ -76,6 +76,13 @@ func (ep *envoyProcess) Stop() {
 }
 
 func main() {
+	// Route "bench" subcommand before flag.Parse() to avoid flag conflicts.
+	if len(os.Args) > 1 && os.Args[1] == "bench" {
+		cfg := parseBenchFlags(os.Args[2:])
+		runBench(cfg)
+		return
+	}
+
 	flag.Parse()
 
 	// Validate binaries exist
