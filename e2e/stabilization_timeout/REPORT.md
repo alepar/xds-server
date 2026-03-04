@@ -2,7 +2,10 @@
 
 ## Test Date and Environment
 
-- **Date**: 2026-03-04 03:26 UTC
+- **Date**: 2026-03-04 05:45 UTC (run 3, with dispatcher.post() fix)
+- **Previous runs**:
+  - Run 2 (05:22 UTC): CRASH — re-entrancy bug in HC callback
+  - Run 1 (03:26 UTC): FAIL — HC not running due to `no_traffic_interval` default
 - **Host**: Linux 6.12.63+deb13-cloud-amd64
 - **Test location**: `/home/debian/AleCode/gt/xds_server/mayor/rig/e2e/stabilization_timeout/`
 
@@ -10,18 +13,18 @@
 
 | Binary | Version | Commit | Build |
 |--------|---------|--------|-------|
-| envoy-static-with-fix | 1.38.0-dev | 6f6efef31f (Clean) | RELEASE/BoringSSL |
+| envoy-static-with-fix | 1.38.0-dev | bd434e1 (Modified) | RELEASE/BoringSSL |
 | envoy-static-without-fix | 1.38.0-dev | 6f6efef31f (Modified) | RELEASE/BoringSSL |
 
-Note: The without-fix binary was built from the same commit with the fix source files
-(`eds.cc`, `eds.h`, `eds_test.cc`) reverted to the parent commit state. The "Modified"
-flag reflects the dirty working tree at build time.
+The with-fix binary includes:
+1. HC callback fix (en-4v2): `maybeRemoveTimedOutHosts()` via `dispatcher.post()` to avoid re-entrancy
+2. Uses `reloadHealthyHostsHelper(nullptr)` since `reloadHealthyHosts()` is private
 
 ## Test Setup
 
 - **xDS server**: Custom Go control plane pushing CDS+EDS snapshots via gRPC
 - **Backend**: Python HTTP servers on ports 8081, 8082 (respond 200 to all requests)
-- **Health checking**: HTTP health checks every 1s on `/healthz`
+- **Health checking**: HTTP health checks every 1s on `/healthz`, `no_traffic_interval=1s`
 - **Cluster**: EDS-type `test-cluster` with active health checking
 - **Stabilization timeout**: Configured via cluster metadata `envoy.eds.host_removal_stabilization_timeout_ms`
 
@@ -38,66 +41,62 @@ stuck in `PENDING_DYNAMIC_REMOVAL` indefinitely.
 
 **Result: PASS**
 
-Hosts correctly remain in `PENDING_DYNAMIC_REMOVAL` state indefinitely after being
-removed from the EDS response. This confirms the baseline behavior: once health-checked
-hosts enter `pending_dynamic_removal`, there is no mechanism to clean them up without
-the stabilization timeout fix.
+Hosts correctly remain in `PENDING_DYNAMIC_REMOVAL` state indefinitely.
 
 ## Scenario 2: With Fix (timeout_ms=5000)
 
-**Purpose**: Verify that with the stabilization timeout configured at 5000ms, removed
-EDS hosts are cleaned up after the timeout period (expected removal at ~5-7s).
+### Run 3 (05:45 UTC) — PASS
+
+With the `dispatcher.post()` fix, the stabilization timeout works correctly:
 
 | Step | Result |
 |------|--------|
 | Hosts after EDS add | 2 (healthy) |
-| Hosts after EDS remove | 2 (pending_dynamic_removal) |
-| Expected removal window | 5-7s after removal |
-| Actual removal | NOT REMOVED after 15s |
+| Hosts removed after target removal | 5s (within expected 5-7s window) |
 
-**Result: FAIL**
+**Result: PASS**
 
-Hosts remained in `PENDING_DYNAMIC_REMOVAL` state for the full 15s observation period,
-identical to the without-fix behavior. The stabilization timeout metadata
-(`envoy.eds.host_removal_stabilization_timeout_ms=5000`) was set on the cluster
-via CDS but did not trigger host removal.
+Hosts are correctly removed within the expected stabilization timeout window.
+The `dispatcher.post()` fix successfully defers `maybeRemoveTimedOutHosts()` to
+the next event loop iteration, avoiding the re-entrancy crash that occurred in run 2.
 
-## Analysis
+### Previous Runs
 
-The fix's stabilization timeout mechanism is not triggering host removal in this
-e2e test scenario. Possible root causes:
+**Run 2 (05:22 UTC) — CRASH**: Re-entrancy bug. The HC callback chain caused
+`maybeRemoveTimedOutHosts()` → `reloadHealthyHosts()` → `onClusterMemberUpdate()`
+to execute within the same call stack, leading to use-after-free (SIGSEGV).
 
-1. **Metadata not being read**: The cluster metadata `envoy.eds.host_removal_stabilization_timeout_ms`
-   may not be parsed from the CDS-delivered cluster config. The implementation may
-   expect the metadata in a different location or format.
+**Run 1 (03:26 UTC) — FAIL**: HC not running. `no_traffic_interval` defaults to
+60s in Envoy. Without traffic, health checks only ran once initially and the
+callback never fired within the 15s test window.
 
-2. **Timer not firing**: The stabilization timeout timer may not be started when hosts
-   enter `pending_dynamic_removal` state via EDS endpoint removal.
+## Summary
 
-3. **Health check interaction**: The active health checker may be preventing host
-   removal even after the stabilization timeout expires. The existing Envoy behavior
-   keeps health-checked hosts in `pending_dynamic_removal` to allow draining.
+| Scenario | Result | Notes |
+|----------|--------|-------|
+| 1: Without fix (baseline) | PASS | Hosts stuck in PENDING_DYNAMIC_REMOVAL as expected |
+| 2: With fix (run 3, dispatcher.post()) | PASS | Hosts removed at 5s (expected 5-7s window) |
 
-4. **EDS update path**: The stabilization timeout may only apply to specific EDS
-   update paths (e.g., locality changes) rather than full endpoint removal.
+## Issues Found and Resolved
 
-## Conclusion
+1. **Test infrastructure**: xDS control plane missing `NoTrafficInterval` in health check config.
+   **Status**: Fixed in `main.go` (run 2).
 
-- **Scenario 1 (baseline)**: PASS — confirms hosts get stuck in `PENDING_DYNAMIC_REMOVAL`
-- **Scenario 2 (with fix)**: FAIL — stabilization timeout does not trigger host cleanup
+2. **Envoy fix (en-4v2)**: Re-entrancy bug — calling `reloadHealthyHosts()` from within a HC
+   callback causes use-after-free crash.
+   **Status**: Fixed via `dispatcher.post()` deferral (commit bd434e1).
 
-The fix needs investigation to determine why the timeout-based host removal is not
-functioning in this e2e scenario. The unit tests for the fix pass (verified separately),
-suggesting the issue may be in how the metadata is delivered via CDS or how the timeout
-interacts with active health checking.
+3. **Test script**: `count_cluster_hosts()` in `test.sh` failed with `set -euo pipefail` when
+   `grep` found no matches (host count = 0), causing premature script exit.
+   **Status**: Fixed — wrapped grep in `{ grep || true; }` to handle zero-match case.
 
-## Raw Test Results
+## Raw Test Results (Run 3)
 
 ```
 === EDS Stabilization Timeout E2E Test ===
-Date: 2026-03-04 03:26:12 UTC
-Binary WITHOUT fix: envoy-static-without-fix
-Binary WITH fix:    envoy-static-with-fix
+Date: 2026-03-04 05:45:56 UTC
+Binary WITHOUT fix: /home/debian/AleCode/gt/xds_server/mayor/rig/e2e/stabilization_timeout/envoy-static-without-fix
+Binary WITH fix:    /home/debian/AleCode/gt/xds_server/mayor/rig/e2e/stabilization_timeout/envoy-static-with-fix
 
 === SCENARIO 1: Without fix ===
 Hosts after add: 2
@@ -108,5 +107,8 @@ RESULT: PASS — hosts remain stuck in PENDING_DYNAMIC_REMOVAL without fix
 === SCENARIO 2: With fix (timeout_ms=5000) ===
 Hosts after add: 2
 Targets removed, polling for removal...
-RESULT: FAIL — hosts still present at 15s (expected removal by ~7s)
+Hosts removed at: 5s
+RESULT: PASS — hosts removed within expected window
+
+=== ALL TESTS PASSED ===
 ```

@@ -1,5 +1,5 @@
 === EDS Stabilization Timeout E2E Test ===
-Date: 2026-03-04 03:26:12 UTC
+Date: 2026-03-04 05:45:56 UTC
 Binary WITHOUT fix: /home/debian/AleCode/gt/xds_server/mayor/rig/e2e/stabilization_timeout/envoy-static-without-fix
 Binary WITH fix:    /home/debian/AleCode/gt/xds_server/mayor/rig/e2e/stabilization_timeout/envoy-static-with-fix
 
@@ -12,4 +12,7 @@ RESULT: PASS — hosts remain stuck in PENDING_DYNAMIC_REMOVAL without fix
 === SCENARIO 2: With fix (timeout_ms=5000) ===
 Hosts after add: 2
 Targets removed, polling for removal...
-RESULT: FAIL — hosts still present at 15s (expected removal by ~7s)
+Hosts removed at: 5s
+RESULT: PASS — hosts removed within expected window
+
+=== ALL TESTS PASSED ===
