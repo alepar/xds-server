@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -185,144 +184,30 @@ func (r *LoadResult) ActualQPS() float64 {
 	return float64(len(r.Records)) / d
 }
 
-// Bucket holds aggregated stats for one time window.
-type Bucket struct {
-	Start   time.Duration // relative to test start
-	End     time.Duration
-	Total   int
-	Success int // status 200
-	Errors  int // non-200 or connection error
-	P50     time.Duration
-	P99     time.Duration
-}
-
-// Timeline produces time-bucketed stats with the given bucket size.
-func (r *LoadResult) Timeline(bucketSize time.Duration) []Bucket {
-	if len(r.Records) == 0 {
-		return nil
-	}
-	duration := r.EndTime.Sub(r.StartTime)
-	numBuckets := int(duration/bucketSize) + 1
-	buckets := make([]Bucket, numBuckets)
-
-	// Initialize bucket time ranges
-	for i := range buckets {
-		buckets[i].Start = time.Duration(i) * bucketSize
-		buckets[i].End = time.Duration(i+1) * bucketSize
-	}
-
-	// Per-bucket latency collections for percentile computation
-	bucketLatencies := make([][]time.Duration, numBuckets)
-
-	for i := range r.Records {
-		offset := r.Records[i].Timestamp.Sub(r.StartTime)
-		idx := int(offset / bucketSize)
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= numBuckets {
-			idx = numBuckets - 1
-		}
-		buckets[idx].Total++
-		if r.Records[i].Status == 200 {
-			buckets[idx].Success++
-		} else {
-			buckets[idx].Errors++
-		}
-		bucketLatencies[idx] = append(bucketLatencies[idx], r.Records[i].Latency)
-	}
-
-	// Compute percentiles per bucket
-	for i := range buckets {
-		lats := bucketLatencies[i]
-		if len(lats) == 0 {
-			continue
-		}
-		sort.Slice(lats, func(a, b int) bool { return lats[a] < lats[b] })
-		buckets[i].P50 = lats[int(float64(len(lats)-1)*0.50)]
-		buckets[i].P99 = lats[int(float64(len(lats)-1)*0.99)]
-	}
-
-	return buckets
-}
-
-// --- JSON serialization ---
-
-type jsonOutput struct {
-	StartTime string           `json:"start_time"`
-	EndTime   string           `json:"end_time"`
-	TargetQPS int              `json:"target_qps"`
-	Summary   jsonSummary      `json:"summary"`
-	Timeline  []jsonBucket     `json:"timeline"`
-	Records   []jsonRecord     `json:"records"`
-}
-
-type jsonSummary struct {
-	Total       int     `json:"total"`
-	SuccessRate float64 `json:"success_rate"`
-	Errors      int     `json:"errors"`
-	ActualQPS   float64 `json:"actual_qps"`
-	P50Us       int64   `json:"p50_us"`
-	P99Us       int64   `json:"p99_us"`
-}
-
-type jsonBucket struct {
-	StartMs int64 `json:"start_ms"`
-	EndMs   int64 `json:"end_ms"`
-	Total   int   `json:"total"`
-	Success int   `json:"success"`
-	Errors  int   `json:"errors"`
-	P50Us   int64 `json:"p50_us"`
-	P99Us   int64 `json:"p99_us"`
-}
-
-type jsonRecord struct {
-	TMs      int64 `json:"t_ms"`
-	LatencyUs int64 `json:"latency_us"`
-	Status   int   `json:"status"`
-}
-
-// WriteJSON saves the full result to a JSON file.
-func (r *LoadResult) WriteJSON(path string) error {
-	timeline := r.Timeline(100 * time.Millisecond)
-
-	out := jsonOutput{
-		StartTime: r.StartTime.Format(time.RFC3339Nano),
-		EndTime:   r.EndTime.Format(time.RFC3339Nano),
-		TargetQPS: r.TargetQPS,
-		Summary: jsonSummary{
-			Total:       r.TotalRequests(),
-			SuccessRate: r.SuccessRate(),
-			Errors:      r.ErrorCount(),
-			ActualQPS:   r.ActualQPS(),
-			P50Us:       r.GetPercentile(50).Microseconds(),
-			P99Us:       r.GetPercentile(99).Microseconds(),
-		},
-	}
-
-	for _, b := range timeline {
-		out.Timeline = append(out.Timeline, jsonBucket{
-			StartMs: b.Start.Milliseconds(),
-			EndMs:   b.End.Milliseconds(),
-			Total:   b.Total,
-			Success: b.Success,
-			Errors:  b.Errors,
-			P50Us:   b.P50.Microseconds(),
-			P99Us:   b.P99.Microseconds(),
-		})
-	}
-
-	for i := range r.Records {
-		out.Records = append(out.Records, jsonRecord{
-			TMs:       r.Records[i].Timestamp.Sub(r.StartTime).Milliseconds(),
-			LatencyUs: r.Records[i].Latency.Microseconds(),
-			Status:    r.Records[i].Status,
-		})
-	}
-
-	data, err := json.MarshalIndent(out, "", "  ")
+// WriteCSV saves per-request records as CSV: start_ms,duration_us,error
+// The swap offset is written as a comment on the first line for R to parse.
+func (r *LoadResult) WriteCSV(path string, swapOffset time.Duration) error {
+	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("marshal json: %w", err)
+		return fmt.Errorf("create csv: %w", err)
 	}
-	return os.WriteFile(path, data, 0644)
+	defer f.Close()
+
+	fmt.Fprintf(f, "# swap_ms=%d\n", swapOffset.Milliseconds())
+	fmt.Fprintln(f, "start_ms,duration_us,error")
+	for i := range r.Records {
+		tMs := r.Records[i].Timestamp.Sub(r.StartTime).Milliseconds()
+		latUs := r.Records[i].Latency.Microseconds()
+		errStr := "none"
+		switch {
+		case r.Records[i].Status == 200:
+			// errStr stays "none"
+		case r.Records[i].Status == 0:
+			errStr = "conn"
+		default:
+			errStr = fmt.Sprintf("%d", r.Records[i].Status)
+		}
+		fmt.Fprintf(f, "%d,%d,%s\n", tMs, latUs, errStr)
+	}
+	return nil
 }

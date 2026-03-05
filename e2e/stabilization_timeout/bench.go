@@ -67,15 +67,15 @@ func runBench(cfg *BenchConfig) {
 		timeoutMs:             0,
 	})
 
-	// Run 2: Fixed (with fix, ignore_health_on_host_removal=false, timeout=60s)
+	// Run 2: Fixed (with fix, ignore_health_on_host_removal=false, timeout=3s)
 	fmt.Println()
-	fmt.Println("━━━ Run 2: Fixed (stabilization_timeout=60s) ━━━")
+	fmt.Println("━━━ Run 2: Fixed (stabilization_timeout=3s) ━━━")
 	fixedResult := runBenchScenario(cfg, benchScenarioConfig{
 		label:                 "fixed",
 		envoyBinary:           cfg.EnvoyWithFix,
 		ignoreHealthOnRemoval: false,
 		ignoreNewHostsUntilHC: true,
-		timeoutMs:             60000,
+		timeoutMs:             3000,
 	})
 
 	// Compare and print summary
@@ -209,12 +209,12 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 	log.Printf("[%s] Load gen done: %d requests, %.1f%% success rate",
 		sc.label, loadResult.TotalRequests(), loadResult.SuccessRate()*100)
 
-	// Save JSON results
-	jsonPath := fmt.Sprintf("bench-result-%s.json", sc.label)
-	if err := loadResult.WriteJSON(jsonPath); err != nil {
-		log.Printf("[%s] warning: failed to write JSON: %v", sc.label, err)
+	// Save CSV results
+	csvPath := fmt.Sprintf("bench-result-%s.csv", sc.label)
+	if err := loadResult.WriteCSV(csvPath, swapOffset); err != nil {
+		log.Printf("[%s] warning: failed to write CSV: %v", sc.label, err)
 	} else {
-		log.Printf("[%s] Results saved to %s", sc.label, jsonPath)
+		log.Printf("[%s] Results saved to %s", sc.label, csvPath)
 	}
 
 	return &benchResult{
@@ -228,10 +228,6 @@ func runBenchScenario(cfg *BenchConfig, sc benchScenarioConfig) *benchResult {
 
 func compareBenchResults(legacy, fixed *benchResult) {
 	printBenchSummary(legacy, fixed)
-	fmt.Println()
-	printTimeline("legacy", legacy.Load, legacy.SwapOffset)
-	fmt.Println()
-	printTimeline("fixed", fixed.Load, fixed.SwapOffset)
 }
 
 func printBenchSummary(legacy, fixed *benchResult) {
@@ -295,59 +291,6 @@ func printBenchSummary(legacy, fixed *benchResult) {
 			label = "Conn Error"
 		}
 		fmt.Printf("  %s: legacy=%d  fixed=%d\n", label, lCounts[code], fCounts[code])
-	}
-}
-
-func printTimeline(label string, result *LoadResult, swapOffset time.Duration) {
-	bucketSize := 100 * time.Millisecond
-	buckets := result.Timeline(bucketSize)
-	if len(buckets) == 0 {
-		return
-	}
-
-	// Only print buckets within ±2s of swap
-	windowBefore := 2 * time.Second
-	windowAfter := 2 * time.Second
-	swapBucketIdx := int(swapOffset / bucketSize)
-
-	fmt.Printf("Timeline (%s) — 100ms buckets, swap at ≈%.1fs\n", label, swapOffset.Seconds())
-	fmt.Printf("%-12s  %5s  %5s  %5s  %5s  %8s  %8s\n",
-		"Time", "Reqs", "200s", "503s", "Errs", "p50", "p99")
-	fmt.Printf("%-12s  %5s  %5s  %5s  %5s  %8s  %8s\n",
-		"──────────", "─────", "─────", "─────", "─────", "────────", "────────")
-
-	startIdx := int((swapOffset - windowBefore) / bucketSize)
-	endIdx := int((swapOffset + windowAfter) / bucketSize)
-	if startIdx < 0 {
-		startIdx = 0
-	}
-	if endIdx >= len(buckets) {
-		endIdx = len(buckets) - 1
-	}
-
-	for i := startIdx; i <= endIdx; i++ {
-		b := buckets[i]
-		if b.Total == 0 {
-			continue
-		}
-		// Count 503s specifically from records in this bucket
-		count503 := 0
-		for _, rec := range result.Records {
-			recOffset := rec.Timestamp.Sub(result.StartTime)
-			if recOffset >= b.Start && recOffset < b.End && rec.Status == 503 {
-				count503++
-			}
-		}
-
-		marker := ""
-		if i == swapBucketIdx {
-			marker = "  ← SWAP"
-		}
-		fmt.Printf("%5.1f-%5.1fs  %5d  %5d  %5d  %5d  %8s  %8s%s\n",
-			b.Start.Seconds(), b.End.Seconds(),
-			b.Total, b.Success, count503, b.Errors,
-			fmtDuration(b.P50), fmtDuration(b.P99),
-			marker)
 	}
 }
 
